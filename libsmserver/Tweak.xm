@@ -33,9 +33,15 @@ static void SMSFileLog(NSString *line) {
 
 #define SMSLog(fmt, ...) do { NSString *smsLine = [NSString stringWithFormat:@"[libsmserver] pid=%d " fmt, getpid(), ##__VA_ARGS__]; NSLog(@"%@", smsLine); SMSFileLog(smsLine); } while (0)
 
+static double const SMSServiceRefreshTimeout = 3.0;
+static double const SMSServiceRefreshSenderTimeout = 8.0;
+static double const SMSIDStatusTimeout = 8.0;
+static NSUInteger const SMSIDStatusMaxAddresses = 25;
+static NSString *const SMSIDStatusService = @"com.apple.madrid";
+static NSString *const SMSIDStatusListener = @"SMServer-IDStatusQuery";
 static unsigned long long const SMSModernCapabilities = 4485895ULL;
 static unsigned int const SMSLegacyCapabilities = 17159;
-static NSString *const SMSTweakVersion = @"0.9.2";
+static NSString *const SMSTweakVersion = @"0.9.3";
 static BOOL SMSInSpringBoard = NO;
 
 static id SMSRunOnMain(NSString *label, id (^block)(void)) {
@@ -190,9 +196,236 @@ static BOOL SMSAddressNeedsIMessage(NSString *address) {
 	return [address hasPrefix:@"chat"] && ![address containsString:@"@"] && address.length >= 20;
 }
 
-static IMChat *SMSChatForAddress(NSString *address, BOOL create) {
+static NSString *SMSDigits(NSString *value) {
+	NSMutableString *digits = [NSMutableString string];
+	for (NSUInteger idx = 0; idx < value.length; idx++) {
+		unichar c = [value characterAtIndex:idx];
+		if (c >= '0' && c <= '9') [digits appendFormat:@"%C", c];
+	}
+	return digits;
+}
+
+static NSString *SMSNormalizedAddress(NSString *value) {
+	if (![value isKindOfClass:[NSString class]]) return @"";
+	NSString *trimmed = [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+	for (NSString *prefix in @[@"mailto:", @"tel:", @"sms:", @"imessage:", @"e:", @"p:"]) {
+		if ([trimmed.lowercaseString hasPrefix:prefix]) {
+			trimmed = [trimmed substringFromIndex:prefix.length];
+			break;
+		}
+	}
+	if ([trimmed containsString:@"@"]) return trimmed.lowercaseString;
+	return SMSDigits(trimmed);
+}
+
+static NSString *SMSAddressType(NSString *address) {
+	return [address containsString:@"@"] ? @"email" : @"phone";
+}
+
+static NSString *SMSAccountPhoneNumber(IMAccount *account) {
+	if (!account) return nil;
+	NSString *login = [account respondsToSelector:@selector(strippedLogin)] ? [account strippedLogin] : nil;
+	if (!login.length && [account respondsToSelector:@selector(loginIMHandle)]) login = [[account loginIMHandle] ID];
+	if (!login.length && [account respondsToSelector:@selector(login)]) login = [account login];
+	if (!login.length) return nil;
+	NSString *lower = login.lowercaseString;
+	if ([lower hasPrefix:@"p:"] || [lower hasPrefix:@"e:"]) login = [login substringFromIndex:2];
+	if ([login containsString:@"@"] || !SMSDigits(login).length) return nil;
+	return login;
+}
+
+static NSArray *SMSAccountSendableAliases(IMAccount *account) {
+	NSArray *vetted = [account respondsToSelector:@selector(vettedAliases)] ? [account vettedAliases] : nil;
+	if (vetted.count) return vetted;
+	NSArray *all = [account respondsToSelector:@selector(aliases)] ? [account aliases] : nil;
+	NSMutableArray *validated = [NSMutableArray array];
+	for (id alias in all) {
+		if (![alias isKindOfClass:[NSString class]]) continue;
+		if ([account respondsToSelector:@selector(validationStatusForAlias:)] && [account validationStatusForAlias:alias] != 3) continue;
+		[validated addObject:alias];
+	}
+	return validated;
+}
+
+static NSArray<NSMutableDictionary *> *SMSCollectSenders(void) {
+	IMAccountController *controller = [%c(IMAccountController) sharedInstance];
+	NSArray *accounts = [controller respondsToSelector:@selector(accounts)] ? [controller accounts] : @[];
+	NSMutableArray<NSMutableDictionary *> *senders = [NSMutableArray array];
+	NSMutableDictionary<NSString *, NSMutableDictionary *> *byKey = [NSMutableDictionary dictionary];
+	NSUInteger skipped = 0;
+	for (IMAccount *account in accounts) {
+		if (![SMSAccountService(account) isEqualToString:@"iMessage"]) continue;
+		BOOL registered = ![account respondsToSelector:@selector(registrationStatus)] || [account registrationStatus] == 5;
+		if (!SMSAccountIsUsable(account) || !registered) {
+			skipped++;
+			continue;
+		}
+		for (id alias in SMSAccountSendableAliases(account)) {
+			if (![alias isKindOfClass:[NSString class]] || ![alias length]) continue;
+			NSString *key = SMSNormalizedAddress(alias);
+			if (!key.length || byKey[key]) continue;
+			NSMutableDictionary *entry = [NSMutableDictionary dictionaryWithDictionary:@{@"address": alias, @"type": SMSAddressType(alias), @"services": [NSMutableArray arrayWithObject:@"iMessage"], @"account": account}];
+			byKey[key] = entry;
+			[senders addObject:entry];
+		}
+	}
+	NSString *smsNumber = SMSAccountPhoneNumber(SMSUsableSMSAccount());
+	if (smsNumber.length) {
+		NSString *key = SMSNormalizedAddress(smsNumber);
+		NSMutableDictionary *entry = byKey[key];
+		if (!entry) {
+			entry = [NSMutableDictionary dictionaryWithDictionary:@{@"address": smsNumber, @"type": @"phone", @"services": [NSMutableArray array]}];
+			byKey[key] = entry;
+			[senders addObject:entry];
+		}
+		[entry[@"services"] addObject:@"SMS"];
+		entry[@"sms"] = @YES;
+	}
+	SMSLog(@"event=senders_collected count=%lu accounts=%lu skipped_accounts=%lu sms=%d", (unsigned long)senders.count, (unsigned long)accounts.count, (unsigned long)skipped, smsNumber.length > 0);
+	return senders;
+}
+
+static NSDictionary *SMSPublicSender(NSDictionary *entry) {
+	return @{@"address": entry[@"address"], @"type": entry[@"type"], @"services": [entry[@"services"] copy] ?: @[]};
+}
+
+static NSDictionary *SMSResolveSender(NSString *requested, NSArray<NSDictionary *> *senders) {
+	NSString *key = SMSNormalizedAddress(requested);
+	if (!key.length) return nil;
+	for (NSDictionary *entry in senders) {
+		if ([SMSNormalizedAddress(entry[@"address"]) isEqualToString:key]) return entry;
+	}
+	if ([key containsString:@"@"] || ![key hasPrefix:@"0"] || key.length < 4) return nil;
+	NSString *national = [key substringFromIndex:1];
+	NSDictionary *match = nil;
+	for (NSDictionary *entry in senders) {
+		if (![entry[@"type"] isEqualToString:@"phone"]) continue;
+		NSString *digits = SMSNormalizedAddress(entry[@"address"]);
+		if (digits.length <= national.length || digits.length - national.length > 3 || ![digits hasSuffix:national]) continue;
+		if (match) {
+			SMSLog(@"event=sender_resolve_ambiguous");
+			return nil;
+		}
+		match = entry;
+	}
+	return match;
+}
+
+static BOOL SMSChatIsGroup(IMChat *chat) {
+	if ([chat respondsToSelector:@selector(chatStyle)]) return [chat chatStyle] == 43;
+	NSString *identifier = [chat respondsToSelector:@selector(chatIdentifier)] ? [chat chatIdentifier] : nil;
+	return [identifier hasPrefix:@"chat"] && ![identifier containsString:@"@"];
+}
+
+static NSString *SMSChatSenderAddress(IMChat *chat) {
+	if (!chat) return nil;
+	IMAccount *account = [chat respondsToSelector:@selector(account)] ? [chat account] : nil;
+	if (![SMSAccountService(account) isEqualToString:@"iMessage"]) {
+		return SMSAccountPhoneNumber(SMSUsableSMSAccount()) ?: SMSAccountPhoneNumber(account);
+	}
+	NSString *handle = [chat respondsToSelector:@selector(lastAddressedHandleID)] ? [chat lastAddressedHandleID] : nil;
+	return handle.length ? handle : nil;
+}
+
+static NSString *SMSApplySender(IMChat *chat, NSDictionary *sender) {
+	NSString *alias = sender[@"address"];
+	IMAccount *account = [chat respondsToSelector:@selector(account)] ? [chat account] : nil;
+	NSString *service = SMSAccountService(account);
+	NSString *current = [chat respondsToSelector:@selector(lastAddressedHandleID)] ? [chat lastAddressedHandleID] : nil;
+	BOOL same = current.length && [SMSNormalizedAddress(current) isEqualToString:SMSNormalizedAddress(alias)];
+	if (![service isEqualToString:@"iMessage"]) {
+		if (![sender[@"sms"] boolValue]) {
+			SMSLog(@"event=sender_rejected reason=sender_requires_imessage service=%@ type=%@", service, sender[@"type"]);
+			return @"sender_requires_imessage";
+		}
+		SMSLog(@"event=sender_kept service=%@ type=%@", service, sender[@"type"]);
+		return nil;
+	}
+	if (same) {
+		SMSLog(@"event=sender_unchanged service=%@ type=%@ group=%d", service, sender[@"type"], SMSChatIsGroup(chat));
+		return nil;
+	}
+	if (SMSChatIsGroup(chat)) {
+		SMSLog(@"event=sender_rejected reason=sender_locked_group current=%d type=%@", current.length > 0, sender[@"type"]);
+		return @"sender_locked_group";
+	}
+	if (![chat respondsToSelector:@selector(setLastAddressedHandleID:)]) {
+		SMSLog(@"event=sender_rejected reason=sender_unsupported");
+		return @"sender_unsupported";
+	}
+	[chat setLastAddressedHandleID:alias];
+	NSString *applied = [chat respondsToSelector:@selector(lastAddressedHandleID)] ? [chat lastAddressedHandleID] : nil;
+	BOOL ok = [SMSNormalizedAddress(applied) isEqualToString:SMSNormalizedAddress(alias)];
+	SMSLog(@"event=sender_applied ok=%d previous_type=%@ type=%@ account_matches=%d", ok, current.length ? SMSAddressType(current) : @"none", sender[@"type"], sender[@"account"] == account);
+	return ok ? nil : @"sender_unsupported";
+}
+
+static IMAccount *SMSNormalizationAccount(void) {
+	IMAccountController *controller = [%c(IMAccountController) sharedInstance];
+	NSArray *accounts = [controller respondsToSelector:@selector(accounts)] ? [controller accounts] : @[];
+	for (IMAccount *account in accounts) {
+		if ([SMSAccountService(account) isEqualToString:@"iMessage"] && SMSAccountIsUsable(account)) return account;
+	}
+	return SMSUsableSMSAccount();
+}
+
+static NSString *SMSIDSDestination(NSString *address, IMAccount *account, NSString **normalized) {
+	NSString *trimmed = [address stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+	for (NSString *prefix in @[@"mailto:", @"tel:", @"sms:", @"imessage:"]) {
+		if ([trimmed.lowercaseString hasPrefix:prefix]) {
+			trimmed = [trimmed substringFromIndex:prefix.length];
+			break;
+		}
+	}
+	if ([trimmed containsString:@"@"]) {
+		NSString *email = trimmed.lowercaseString;
+		NSArray *parts = [email componentsSeparatedByString:@"@"];
+		if (parts.count != 2 || ![parts[0] length] || ![parts[1] containsString:@"."]) return nil;
+		*normalized = email;
+		return [@"mailto:" stringByAppendingString:email];
+	}
+	NSString *digits = SMSDigits(trimmed);
+	if (digits.length < 7) return nil;
+	IMHandle *handle = [account respondsToSelector:@selector(imHandleWithID:)] ? [account imHandleWithID:trimmed] : nil;
+	NSString *phone = [handle respondsToSelector:@selector(ID)] ? [handle ID] : nil;
+	if (![phone hasPrefix:@"+"] && [trimmed hasPrefix:@"+"]) phone = trimmed;
+	if (![phone hasPrefix:@"+"] || SMSDigits(phone).length < 8) return nil;
+	phone = [@"+" stringByAppendingString:SMSDigits(phone)];
+	*normalized = phone;
+	return [@"tel:" stringByAppendingString:phone];
+}
+
+static dispatch_queue_t SMSIDStatusQueue(void) {
+	static dispatch_queue_t queue = nil;
+	static dispatch_once_t onceToken;
+	dispatch_once(&onceToken, ^{
+		queue = dispatch_queue_create("com.ianwelker.smserver.idstatus", DISPATCH_QUEUE_SERIAL);
+	});
+	return queue;
+}
+
+static IMChat *SMSExistingIMessageChat(NSString *address) {
+	IMChatRegistry *registry = [%c(IMChatRegistry) sharedInstance];
+	if ([registry respondsToSelector:@selector(existingChatWithGUID:)]) {
+		IMChat *chat = [registry existingChatWithGUID:[@"iMessage;-;" stringByAppendingString:address]];
+		if (chat && [SMSAccountService([chat account]) isEqualToString:@"iMessage"]) return chat;
+	}
+	if (![registry respondsToSelector:@selector(allExistingChats)]) return nil;
+	for (IMChat *candidate in [registry allExistingChats]) {
+		if (![[candidate chatIdentifier] isEqualToString:address]) continue;
+		if ([SMSAccountService([candidate account]) isEqualToString:@"iMessage"]) return candidate;
+	}
+	return nil;
+}
+
+static IMChat *SMSChatForAddress(NSString *address, BOOL create, NSDictionary *sender) {
 	IMChatRegistry *registry = [%c(IMChatRegistry) sharedInstance];
 	IMChat *chat = [registry existingChatWithChatIdentifier:address];
+	if (chat && sender[@"account"] && ![sender[@"sms"] boolValue] && ![SMSAccountService([chat account]) isEqualToString:@"iMessage"]) {
+		IMChat *imessageChat = SMSExistingIMessageChat(address);
+		SMSLog(@"event=chat_found source=existing service=%@ imessage_sibling=%d", SMSAccountService([chat account]), imessageChat != nil);
+		return imessageChat ?: chat;
+	}
 	if (chat) {
 		SMSLog(@"event=chat_found source=existing");
 		return chat;
@@ -214,11 +447,17 @@ static IMChat *SMSChatForAddress(NSString *address, BOOL create) {
 		SMSLog(@"event=chat_create_refused reason=imessage_required service=%@", SMSAccountService(account));
 		return nil;
 	}
+	BOOL useSender = sender[@"account"] && [SMSAccountService(account) isEqualToString:@"iMessage"];
+	if (useSender) account = sender[@"account"];
 	IMHandle *handle = nil;
 	if ([account respondsToSelector:@selector(imHandleWithID:)]) handle = [account imHandleWithID:address];
 	if (!handle) handle = [[%c(IMHandle) alloc] initWithAccount:account ID:address alreadyCanonical:YES];
-	chat = handle ? [registry chatForIMHandle:handle] : nil;
-	SMSLog(@"event=chat_created handle=%d chat=%d", handle != nil, chat != nil);
+	if (handle && useSender && [registry respondsToSelector:@selector(chatForIMHandle:lastAddressedHandle:lastAddressedSIMID:)]) {
+		chat = [registry chatForIMHandle:handle lastAddressedHandle:sender[@"address"] lastAddressedSIMID:nil];
+	} else {
+		chat = handle ? [registry chatForIMHandle:handle] : nil;
+	}
+	SMSLog(@"event=chat_created handle=%d chat=%d service=%@ with_sender=%d", handle != nil, chat != nil, SMSAccountService(account), useSender);
 	return chat;
 }
 
@@ -331,11 +570,22 @@ static id SMSChatItemForGUID(IMChat *chat, NSString *structuredGUID) {
 	return part;
 }
 
-static NSDictionary *SMSSendResult(BOOL ok, NSString *reason, NSString *service) {
+static NSDictionary *SMSSendResult(BOOL ok, NSString *reason, NSString *service, NSString *from) {
 	NSMutableDictionary *result = [NSMutableDictionary dictionaryWithObject:@(ok) forKey:@"ok"];
 	if (reason) result[@"reason"] = reason;
 	if (service) result[@"service"] = service;
+	if (from.length) result[@"from"] = from;
 	return result;
+}
+
+static NSString *SMSSentFromAddress(IMChat *chat, IMMessage *message) {
+	IMHandle *handle = [message respondsToSelector:@selector(sender)] ? [message sender] : nil;
+	NSString *identifier = [handle respondsToSelector:@selector(ID)] ? [handle ID] : nil;
+	NSString *lower = identifier.lowercaseString;
+	if ([lower hasPrefix:@"p:"] || [lower hasPrefix:@"e:"]) identifier = [identifier substringFromIndex:2];
+	NSString *chatSender = SMSChatSenderAddress(chat);
+	SMSLog(@"event=send_sender_observed message_sender=%d chat_sender=%d match=%d", identifier.length > 0, chatSender.length > 0, identifier.length && chatSender.length && [SMSNormalizedAddress(identifier) isEqualToString:SMSNormalizedAddress(chatSender)]);
+	return identifier.length ? identifier : chatSender;
 }
 
 @interface SMSSpringBoardService : NSObject
@@ -398,6 +648,8 @@ static NSDictionary *SMSSendResult(BOOL ok, NSString *reason, NSString *service)
 	if ([method isEqualToString:@"getPinnedChats"]) return [self getPinnedChats];
 	if ([method isEqualToString:@"delete"]) return [self deleteObject:args];
 	if ([method isEqualToString:@"sendTyping"]) return [self sendTyping:args];
+	if ([method isEqualToString:@"getSenders"]) return [self getSenders];
+	if ([method isEqualToString:@"getIMessageStatus"]) return [self getIMessageStatus:args];
 	SMSLog(@"event=ipc_unknown_method method=%@", method);
 	[NSException raise:@"SMSUnknownMethod" format:@"unknown method %@", method];
 	return nil;
@@ -413,35 +665,184 @@ static NSDictionary *SMSSendResult(BOOL ok, NSString *reason, NSString *service)
 	return @{@"version": SMSTweakVersion, @"pid": @(getpid()), @"connected": @(connected), @"capabilities": state[@"capabilities"] ?: @0};
 }
 
+- (void)refreshServiceForAddress:(NSString *)address timeout:(double)timeout {
+	NSString *initial = SMSRunOnMain(@"service_refresh_start", ^id{
+		IMChat *chat = [[%c(IMChatRegistry) sharedInstance] existingChatWithChatIdentifier:address];
+		if (!chat || ![chat respondsToSelector:@selector(refreshServiceForSending)] || ![chat respondsToSelector:@selector(hasRefreshedServiceForSending)]) return nil;
+		if ([chat hasRefreshedServiceForSending]) return nil;
+		NSString *service = SMSAccountService([chat account]);
+		if ([service isEqualToString:@"iMessage"]) return nil;
+		[chat refreshServiceForSending];
+		return service;
+	});
+	if (!initial) return;
+	SMSLog(@"event=service_refresh_started service=%@ timeout_s=%.1f", initial, timeout);
+	CFAbsoluteTime startedAt = CFAbsoluteTimeGetCurrent();
+	while (CFAbsoluteTimeGetCurrent() - startedAt < timeout) {
+		usleep(100000);
+		NSString *service = SMSRunOnMain(@"service_refresh_poll", ^id{
+			IMChat *chat = [[%c(IMChatRegistry) sharedInstance] existingChatWithChatIdentifier:address];
+			return chat ? SMSAccountService([chat account]) : nil;
+		});
+		if (service && ![service isEqualToString:initial]) {
+			SMSLog(@"event=service_refresh_done waited_ms=%.0f before=%@ after=%@", (CFAbsoluteTimeGetCurrent() - startedAt) * 1000.0, initial, service);
+			return;
+		}
+	}
+	SMSLog(@"event=service_refresh_unchanged waited_s=%.1f service=%@", timeout, initial);
+}
+
+- (NSDictionary *)getIMessageStatus:(id)vals {
+	id raw = [vals isKindOfClass:[NSDictionary class]] ? vals[@"addresses"] : nil;
+	NSArray *addresses = [raw isKindOfClass:[NSArray class]] ? raw : nil;
+	if (!addresses.count || addresses.count > SMSIDStatusMaxAddresses) {
+		SMSLog(@"event=idstatus_rejected reason=invalid_addresses count=%lu", (unsigned long)addresses.count);
+		return @{@"ok": @NO, @"reason": @"invalid_addresses"};
+	}
+	Class queryClass = %c(IDSIDQueryController);
+	IDSIDQueryController *controller = [queryClass respondsToSelector:@selector(sharedInstance)] ? [queryClass sharedInstance] : nil;
+	if (![controller respondsToSelector:@selector(refreshIDStatusForDestinations:service:listenerID:queue:completionBlock:)]) {
+		SMSLog(@"event=idstatus_failed reason=ids_unavailable class=%d", queryClass != nil);
+		return @{@"ok": @NO, @"reason": @"ids_unavailable"};
+	}
+	NSArray<NSDictionary *> *rows = SMSRunOnMain(@"idstatus_prepare", ^id{
+		IMAccount *account = SMSNormalizationAccount();
+		NSMutableArray *prepared = [NSMutableArray arrayWithCapacity:addresses.count];
+		for (id address in addresses) {
+			NSString *input = [address isKindOfClass:[NSString class]] ? address : @"";
+			NSString *normalized = nil;
+			NSString *destination = input.length ? SMSIDSDestination(input, account, &normalized) : nil;
+			NSMutableDictionary *row = [NSMutableDictionary dictionaryWithObject:input forKey:@"address"];
+			if (destination) {
+				row[@"destination"] = destination;
+				row[@"normalized"] = normalized;
+			}
+			[prepared addObject:row];
+		}
+		return prepared;
+	});
+	if (!rows) return @{@"ok": @NO, @"reason": @"internal_error"};
+	NSMutableOrderedSet<NSString *> *destinations = [NSMutableOrderedSet orderedSet];
+	for (NSDictionary *row in rows) {
+		if (row[@"destination"]) [destinations addObject:row[@"destination"]];
+	}
+	__block NSDictionary *statuses = nil;
+	BOOL timedOut = NO;
+	CFAbsoluteTime startedAt = CFAbsoluteTimeGetCurrent();
+	if (destinations.count) {
+		dispatch_semaphore_t done = dispatch_semaphore_create(0);
+		BOOL started = [controller refreshIDStatusForDestinations:destinations.array service:SMSIDStatusService listenerID:SMSIDStatusListener queue:SMSIDStatusQueue() completionBlock:^(NSDictionary *result) {
+			statuses = [result isKindOfClass:[NSDictionary class]] ? [result copy] : @{};
+			dispatch_semaphore_signal(done);
+		}];
+		if (started) {
+			timedOut = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(SMSIDStatusTimeout * NSEC_PER_SEC))) != 0;
+		} else {
+			SMSLog(@"event=idstatus_query_not_started destinations=%lu", (unsigned long)destinations.count);
+		}
+	}
+	NSDictionary *results = timedOut ? @{} : (statuses ?: @{});
+	NSMutableArray *items = [NSMutableArray arrayWithCapacity:rows.count];
+	NSUInteger registered = 0, unregistered = 0, unknown = 0, invalid = 0;
+	for (NSDictionary *row in rows) {
+		NSString *destination = row[@"destination"];
+		NSString *status = @"invalid_address";
+		NSNumber *imessage = nil;
+		if (destination) {
+			NSInteger code = [results[destination] respondsToSelector:@selector(integerValue)] ? [results[destination] integerValue] : 0;
+			if (code == 1) {
+				status = @"registered";
+				imessage = @YES;
+				registered++;
+			} else if (code == 2) {
+				status = @"not_registered";
+				imessage = @NO;
+				unregistered++;
+			} else {
+				status = @"unknown";
+				unknown++;
+			}
+		} else {
+			invalid++;
+		}
+		NSMutableDictionary *item = [NSMutableDictionary dictionaryWithDictionary:@{@"address": row[@"address"], @"status": status}];
+		if (row[@"normalized"]) item[@"normalized"] = row[@"normalized"];
+		if (imessage) item[@"imessage"] = imessage;
+		[items addObject:item];
+	}
+	double elapsed = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000.0;
+	SMSLog(@"event=idstatus_done count=%lu registered=%lu not_registered=%lu unknown=%lu invalid=%lu timed_out=%d elapsed_ms=%.0f", (unsigned long)items.count, (unsigned long)registered, (unsigned long)unregistered, (unsigned long)unknown, (unsigned long)invalid, timedOut, elapsed);
+	return @{@"ok": @YES, @"items": items, @"timed_out": @(timedOut), @"elapsed_ms": @((long long)elapsed)};
+}
+
+- (NSDictionary *)getSenders {
+	if (!SMSEnsureDaemonConnected(5.0)) {
+		SMSLog(@"event=senders_failed reason=daemon_unavailable");
+		return @{@"ok": @NO, @"reason": @"daemon_unavailable"};
+	}
+	NSDictionary *result = SMSRunOnMain(@"get_senders", ^id{
+		NSMutableArray *items = [NSMutableArray array];
+		for (NSDictionary *entry in SMSCollectSenders()) [items addObject:SMSPublicSender(entry)];
+		return @{@"ok": @YES, @"items": items};
+	});
+	return result ?: @{@"ok": @NO, @"reason": @"internal_error"};
+}
+
 - (NSDictionary *)sendText:(id)vals {
 	NSString *address = SMSStringArg(vals, @"address");
 	NSString *body = SMSStringArg(vals, @"body") ?: @"";
 	NSString *subject = SMSStringArg(vals, @"subject") ?: @"";
+	NSString *from = [SMSStringArg(vals, @"from") stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 	id rawAttachments = [vals isKindOfClass:[NSDictionary class]] ? vals[@"attachment"] : nil;
 	NSArray *attachments = [rawAttachments isKindOfClass:[NSArray class]] ? rawAttachments : @[];
-	SMSLog(@"event=send_text_request body_length=%lu subject_length=%lu attachments=%lu", (unsigned long)body.length, (unsigned long)subject.length, (unsigned long)attachments.count);
+	SMSLog(@"event=send_text_request body_length=%lu subject_length=%lu attachments=%lu from=%@", (unsigned long)body.length, (unsigned long)subject.length, (unsigned long)attachments.count, from.length ? SMSAddressType(from) : @"none");
 	if (!address.length) {
 		SMSLog(@"event=send_text_rejected reason=missing_address");
-		return SMSSendResult(NO, @"missing_address", nil);
+		return SMSSendResult(NO, @"missing_address", nil, nil);
 	}
 	if (!body.length && !attachments.count) {
 		SMSLog(@"event=send_text_rejected reason=empty_message");
-		return SMSSendResult(NO, @"empty_message", nil);
+		return SMSSendResult(NO, @"empty_message", nil, nil);
 	}
 	if (!SMSEnsureDaemonConnected(5.0)) {
 		SMSLog(@"event=send_text_rejected reason=daemon_unavailable");
-		return SMSSendResult(NO, @"daemon_unavailable", nil);
+		return SMSSendResult(NO, @"daemon_unavailable", nil, nil);
 	}
+	[self refreshServiceForAddress:address timeout:from.length ? SMSServiceRefreshSenderTimeout : SMSServiceRefreshTimeout];
 	NSDictionary *result = SMSRunOnMain(@"send_text", ^id{
 		NSString *reason = nil;
-		IMChat *found = SMSChatForAddress(address, YES);
+		NSDictionary *sender = nil;
+		if (from.length) {
+			sender = SMSResolveSender(from, SMSCollectSenders());
+			if (!sender) {
+				SMSLog(@"event=send_text_failed reason=sender_unavailable type=%@", SMSAddressType(from));
+				return SMSSendResult(NO, @"sender_unavailable", nil, nil);
+			}
+		}
+		IMChat *found = SMSChatForAddress(address, YES, sender);
 		if (!found && SMSAddressNeedsIMessage(address)) reason = @"chat_not_found";
 		IMChat *chat = found ? SMSSendableChat(found, address, &reason) : nil;
 		if (!chat) {
 			SMSLog(@"event=send_text_failed reason=%@", reason ?: @"no_chat");
-			return SMSSendResult(NO, reason ?: @"no_chat", nil);
+			return SMSSendResult(NO, reason ?: @"no_chat", nil, nil);
+		}
+		IMAccount *chatAccount = [chat respondsToSelector:@selector(account)] ? [chat account] : nil;
+		NSString *service = SMSAccountService(chatAccount);
+		if (sender) {
+			NSString *senderFailure = SMSApplySender(chat, sender);
+			if (senderFailure) return SMSSendResult(NO, senderFailure, service, SMSChatSenderAddress(chat));
 		}
 		CKConversation *conversation = SMSConversationForChat(chat, nil);
+		if (conversation && [conversation respondsToSelector:@selector(selectedLastAddressedHandle)]) {
+			id selected = [conversation selectedLastAddressedHandle];
+			NSString *chatSender = SMSChatSenderAddress(chat);
+			BOOL stale = [selected isKindOfClass:[NSString class]] && chatSender.length && ![SMSNormalizedAddress(selected) isEqualToString:SMSNormalizedAddress(chatSender)];
+			SMSLog(@"event=conversation_sender_state selected=%d stale=%d", selected != nil, stale);
+			if (stale && [service isEqualToString:@"iMessage"] && [conversation respondsToSelector:@selector(setSelectedLastAddressedHandle:)]) {
+				[conversation setSelectedLastAddressedHandle:chatSender];
+				SMSLog(@"event=conversation_sender_synced");
+			}
+		}
 		NSAttributedString *text = [[NSAttributedString alloc] initWithString:body];
 		if (conversation) {
 			CKComposition *composition = [%c(CKComposition) composition];
@@ -463,13 +864,11 @@ static NSDictionary *SMSSendResult(BOOL ok, NSString *reason, NSString *service)
 			}
 			if (text.length) composition = [composition compositionByAppendingText:text];
 			if (subject.length) [composition setSubject:[[NSAttributedString alloc] initWithString:subject]];
-			id message = [conversation messageWithComposition:composition];
+			IMMessage *message = [conversation messageWithComposition:composition];
 			if (!message) {
 				SMSLog(@"event=send_text_failed reason=message_from_composition_nil");
-				return SMSSendResult(NO, @"compose_failed", nil);
+				return SMSSendResult(NO, @"compose_failed", nil, nil);
 			}
-			IMAccount *chatAccount = [chat respondsToSelector:@selector(account)] ? [chat account] : nil;
-			NSString *service = SMSAccountService(chatAccount);
 			Class serviceClass = %c(IMServiceImpl);
 			id smsService = [serviceClass respondsToSelector:@selector(smsService)] ? [serviceClass smsService] : nil;
 			if ([service isEqualToString:@"SMS"] && smsService && [conversation respondsToSelector:@selector(sendMessage:onService:newComposition:)]) {
@@ -477,9 +876,10 @@ static NSDictionary *SMSSendResult(BOOL ok, NSString *reason, NSString *service)
 			} else {
 				[conversation sendMessage:message newComposition:YES];
 			}
-			SMSLog(@"event=send_text_dispatched path=composition service=%@ attachments=%lu guid=%@", service, (unsigned long)added, [message respondsToSelector:@selector(guid)] ? [message guid] : @"?");
-			if (attachments.count && !added) return SMSSendResult(NO, @"attachment_unreadable", service);
-			return SMSSendResult(YES, nil, service);
+			NSString *sentFrom = SMSSentFromAddress(chat, message);
+			SMSLog(@"event=send_text_dispatched path=composition service=%@ attachments=%lu from=%@ guid=%@", service, (unsigned long)added, sentFrom.length ? SMSAddressType(sentFrom) : @"unknown", [message respondsToSelector:@selector(guid)] ? [message guid] : @"?");
+			if (attachments.count && !added) return SMSSendResult(NO, @"attachment_unreadable", service, sentFrom);
+			return SMSSendResult(YES, nil, service, sentFrom);
 		}
 		if (chat && !attachments.count) {
 			Class messageClass = %c(IMMessage);
@@ -491,23 +891,24 @@ static NSDictionary *SMSSendResult(BOOL ok, NSString *reason, NSString *service)
 			}
 			if (!message) {
 				SMSLog(@"event=send_text_failed reason=instant_message_nil");
-				return SMSSendResult(NO, @"compose_failed", nil);
+				return SMSSendResult(NO, @"compose_failed", nil, nil);
 			}
 			[chat sendMessage:message];
-			SMSLog(@"event=send_text_dispatched path=imchat guid=%@", [message guid]);
-			return SMSSendResult(YES, nil, SMSAccountService([chat account]));
+			NSString *sentFrom = SMSSentFromAddress(chat, message);
+			SMSLog(@"event=send_text_dispatched path=imchat from=%@ guid=%@", sentFrom.length ? SMSAddressType(sentFrom) : @"unknown", [message guid]);
+			return SMSSendResult(YES, nil, service, sentFrom);
 		}
 		SMSLog(@"event=send_text_failed reason=no_conversation chat=%d conversation=%d", chat != nil, conversation != nil);
-		return SMSSendResult(NO, @"no_conversation", nil);
+		return SMSSendResult(NO, @"no_conversation", nil, nil);
 	});
-	return result ?: SMSSendResult(NO, @"internal_error", nil);
+	return result ?: SMSSendResult(NO, @"internal_error", nil, nil);
 }
 
 - (NSNumber *)setAllAsRead:(id)chatId {
 	if (![chatId isKindOfClass:[NSString class]] || ![chatId length]) return @NO;
 	if (!SMSEnsureDaemonConnected(5.0)) return @NO;
 	NSNumber *result = SMSRunOnMain(@"mark_read", ^id{
-		IMChat *chat = SMSChatForAddress(chatId, NO);
+		IMChat *chat = SMSChatForAddress(chatId, NO, nil);
 		if (!chat) return @NO;
 		[chat markAllMessagesAsRead];
 		SMSLog(@"event=mark_read_done");
@@ -522,7 +923,7 @@ static NSDictionary *SMSSendResult(BOOL ok, NSString *reason, NSString *service)
 	if (!chatId.length) return @NO;
 	if (!SMSEnsureDaemonConnected(3.0)) return @NO;
 	NSNumber *result = SMSRunOnMain(@"send_typing", ^id{
-		IMChat *chat = SMSChatForAddress(chatId, NO);
+		IMChat *chat = SMSChatForAddress(chatId, NO, nil);
 		if (!chat || ![chat respondsToSelector:@selector(setLocalUserIsTyping:)]) return @NO;
 		[chat setLocalUserIsTyping:typing];
 		SMSLog(@"event=typing_sent typing=%d", typing);
@@ -541,7 +942,7 @@ static NSDictionary *SMSSendResult(BOOL ok, NSString *reason, NSString *service)
 	}
 	if (!SMSEnsureDaemonConnected(5.0)) return @NO;
 	NSNumber *result = SMSRunOnMain(@"send_tapback", ^id{
-		IMChat *chat = SMSChatForAddress(chatId, NO);
+		IMChat *chat = SMSChatForAddress(chatId, NO, nil);
 		if (!chat) return @NO;
 		id item = SMSChatItemForGUID(chat, guid);
 		if (!item) return @NO;
@@ -598,7 +999,7 @@ static NSDictionary *SMSSendResult(BOOL ok, NSString *reason, NSString *service)
 	if (!chatId.length) return @NO;
 	if (!SMSEnsureDaemonConnected(5.0)) return @NO;
 	NSNumber *result = SMSRunOnMain(@"delete", ^id{
-		IMChat *chat = SMSChatForAddress(chatId, NO);
+		IMChat *chat = SMSChatForAddress(chatId, NO, nil);
 		if (!chat) return @NO;
 		if (!text.length) {
 			[chat remove];
@@ -716,6 +1117,7 @@ static void SMSNoteTyping(IMMessageItem *item, BOOL typing) {
 		if (!SMSInSpringBoard) return;
 		dlopen("/System/Library/PrivateFrameworks/IMCore.framework/IMCore", RTLD_LAZY);
 		dlopen("/System/Library/PrivateFrameworks/ChatKit.framework/ChatKit", RTLD_LAZY);
+		dlopen("/System/Library/PrivateFrameworks/IDS.framework/IDS", RTLD_LAZY);
 		Class daemonClass = objc_getClass("IMDaemonController");
 		if (daemonClass && class_getInstanceMethod(daemonClass, @selector(processCapabilities))) {
 			%init(CapabilitiesModern);

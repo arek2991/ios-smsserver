@@ -90,6 +90,13 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/
 curl -s -X POST -H "Authorization: Bearer $TOKEN" -F "text=Photo" -F "attachments=@a.jpg" "http://<iphone-ip>:8741/api/v1/chats/%2B15551234567/messages"
 ```
 
+Send from a specific address of this iPhone (any `address` from `GET /api/v1/senders`), and check first whether the recipient can receive iMessage:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" "http://<iphone-ip>:8741/api/v1/imessage-status?address=+15551234567"
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"text":"Hello","from":"me@icloud.com"}' "http://<iphone-ip>:8741/api/v1/chats/%2B15551234567/messages"
+```
+
 Main endpoints, all under `/api/v1`:
 
 - `GET /health` (no auth), `GET /server`, `GET /server/tweak`
@@ -100,6 +107,7 @@ Main endpoints, all under `/api/v1`:
 - `POST /chats/{chat_id}/read`, `POST /chats/{chat_id}/typing`
 - `GET /search?q`, `GET /contacts/match?q`, `GET /contacts/{chat_id}/photo`
 - `GET /attachments/{path}` (supports Range requests), `GET /photos`, `GET /photos/{path}`
+- `GET /senders` (addresses you can send from; pass one as `from` when sending), `GET|POST /imessage-status?address` (whether recipients can receive iMessage, up to 25 per request)
 
 Encode `+` as `%2B` and `@` as `%40` in `chat_id`. Errors use `{"error": {"code": …, "message": …}}`. A send returns `202` once Messages has accepted it.
 

@@ -41,6 +41,25 @@ struct APIError: Error {
 	static func sendFailed(_ message: String) -> APIError {
 		return APIError(502, "send_failed", message)
 	}
+
+	static func invalidSender(_ message: String, details: [String: Any]) -> APIError {
+		return APIError(400, "invalid_sender", message, details: details)
+	}
+
+	static func tweakUnreachable(_ message: String) -> APIError {
+		return APIError(502, "tweak_unreachable", message)
+	}
+}
+
+struct SendOutcome {
+	let code: Int
+	let reason: String?
+	let service: String?
+	let from: String?
+
+	var isSenderProblem: Bool {
+		return reason?.hasPrefix("sender_") ?? false
+	}
 }
 
 struct APIAuth {
@@ -652,6 +671,9 @@ class ServerDelegate {
 		if decorated["pinned"] == nil {
 			decorated["pinned"] = false
 		}
+		if decorated["from"] == nil {
+			decorated["from"] = NSNull()
+		}
 		return decorated
 	}
 
@@ -872,11 +894,11 @@ class ServerDelegate {
 			if req.method == .post {
 				let params = req.body as? Dictionary<String, Any> ?? [String:Any]()
 				let files = self.collectUploadedFiles(req)
-				let code = ServerDelegate.sendText(params: params, new_files: files)
+				let outcome = ServerDelegate.sendText(params: params, new_files: files)
 
-				if code != 200 {
-					let fail_msg = code == 400 ? "Please include either `body`, `subject`, `photos`, or `attachments` in your POST request" : ServerDelegate.sendFailureMessage(ServerDelegate.lastSendFailure)
-					res.setStatusCode(UInt(code), description: fail_msg)
+				if outcome.code != 200 {
+					let fail_msg = outcome.code == 400 && outcome.reason == nil ? "Please include either `body`, `subject`, `photos`, or `attachments` in your POST request" : ServerDelegate.sendFailureMessage(outcome.reason)
+					res.setStatusCode(UInt(outcome.code), description: fail_msg)
 				}
 			} else if req.method == .get {
 				let send_response = ServerDelegate.sendGetRequest(params: req.query)
@@ -1176,6 +1198,24 @@ class ServerDelegate {
 
 			case "contacts":
 				try routeContacts(Array(parts.dropFirst()), method: method, req: req, res: res, ip: ip, cors: cors)
+
+			case "senders":
+				try requireMethod(method, oneOf: [.get])
+				_ = try requireAuth(req, ip: ip)
+				guard parts.count == 1 else {
+					throw APIError.notFound("No such endpoint")
+				}
+				let items = try listSenders()
+				sendJSON(res, ["items": items, "count": items.count], extra: cors)
+
+			case "imessage-status":
+				try requireMethod(method, oneOf: [.get, .post])
+				_ = try requireAuth(req, ip: ip)
+				guard parts.count == 1 else {
+					throw APIError.notFound("No such endpoint")
+				}
+				let result = try imessageStatus(ServerDelegate.statusAddresses(req))
+				sendJSON(res, result, extra: cors)
 
 			case "attachments":
 				try requireMethod(method, oneOf: [.get])
@@ -1707,10 +1747,69 @@ class ServerDelegate {
 		]
 	}
 
+	func listSenders() throws -> [[String: Any]] {
+		guard let raw = ServerDelegate.sender.getSenders() else {
+			Const.log("event=senders.list.failed reason=tweak_unreachable", warning: true)
+			throw APIError.tweakUnreachable("The Messages tweak in SpringBoard did not return the sender addresses. Respring the device or reinstall libsmserver 0.9.3 or later.")
+		}
+		let items = raw.compactMap({ $0 as? [String: Any] })
+		Const.log("event=senders.list count=\(items.count)")
+		return items
+	}
+
+	static let imessageStatusMaxAddresses = 25
+
+	static func statusAddresses(_ req: CRRequest) -> [String] {
+		let body = jsonBody(req)
+		var raw = [String]()
+		if let list = body["addresses"] as? [Any] {
+			raw += list.compactMap({ $0 as? String })
+		}
+		for key in ["addresses", "address"] {
+			if let joined = body[key] as? String {
+				raw += joined.split(separator: ",").map({ String($0) })
+			}
+			if let joined = req.query[key] {
+				raw += joined.split(separator: ",").map({ String($0) })
+			}
+		}
+		var seen = Set<String>()
+		return raw.map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) }).filter({ !$0.isEmpty && seen.insert($0).inserted })
+	}
+
+	func imessageStatus(_ addresses: [String]) throws -> [String: Any] {
+		guard !addresses.isEmpty else {
+			throw APIError.badRequest("Provide at least one address (`address` query parameter, comma separated, or `addresses` in a JSON body)")
+		}
+		guard addresses.count <= ServerDelegate.imessageStatusMaxAddresses else {
+			throw APIError.badRequest("At most \(ServerDelegate.imessageStatusMaxAddresses) addresses per request", details: ["count": addresses.count, "max": ServerDelegate.imessageStatusMaxAddresses])
+		}
+		guard let result = ServerDelegate.sender.getIMessageStatus(addresses) as? [String: Any] else {
+			Const.log("event=imessage_status.failed reason=tweak_unreachable count=\(addresses.count)", warning: true)
+			throw APIError.tweakUnreachable("The Messages tweak in SpringBoard did not answer. Respring the device or reinstall libsmserver 0.9.3 or later.")
+		}
+		guard result["ok"] as? Bool ?? false else {
+			let reason = result["reason"] as? String ?? "unknown"
+			Const.log("event=imessage_status.failed reason=\(reason) count=\(addresses.count)", warning: true)
+			throw APIError(502, "lookup_failed", "Messages could not look up iMessage availability (\(reason)).")
+		}
+		let items: [[String: Any]] = (result["items"] as? [Any] ?? []).compactMap({ raw in
+			guard var item = raw as? [String: Any] else { return nil }
+			for key in ["normalized", "imessage"] where item[key] == nil {
+				item[key] = NSNull()
+			}
+			return item
+		})
+		let timed_out = result["timed_out"] as? Bool ?? false
+		Const.log("event=imessage_status count=\(items.count) timed_out=\(timed_out) elapsed_ms=\(result["elapsed_ms"] as? Int ?? -1)")
+		return ["items": items, "count": items.count, "timed_out": timed_out]
+	}
+
 	func sendMessage(_ chat_id: String, req: CRRequest, ip: String) throws -> [String: Any] {
 		let body = ServerDelegate.jsonBody(req)
 		let text = ServerDelegate.bodyString(body, "text") ?? ""
 		let subject = ServerDelegate.bodyString(body, "subject") ?? ""
+		let from = (ServerDelegate.bodyString(body, "from") ?? req.query["from"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
 
 		var photos = [String]()
 		if let list = body["photos"] as? [Any] {
@@ -1730,17 +1829,29 @@ class ServerDelegate {
 		if !photos.isEmpty {
 			params["photos"] = photos.joined(separator: ":")
 		}
+		if !from.isEmpty {
+			params["from"] = from
+		}
 
-		Const.log("event=message.send chat=\(chat_id) text_len=\(text.count) subject_len=\(subject.count) photos=\(photos.count) files=\(files.count) ip=\(ip)")
+		Const.log("event=message.send chat=\(chat_id) text_len=\(text.count) subject_len=\(subject.count) photos=\(photos.count) files=\(files.count) from_given=\(!from.isEmpty) ip=\(ip)")
 
-		let code = ServerDelegate.sendText(params: params, new_files: files)
-		switch code {
+		let outcome = ServerDelegate.sendText(params: params, new_files: files)
+		if outcome.isSenderProblem {
+			let available = ((try? listSenders()) ?? []).compactMap({ $0["address"] as? String })
+			Const.log("event=message.send.invalid_sender chat=\(chat_id) reason=\(outcome.reason ?? "none") available=\(available.count)", warning: true)
+			var details: [String: Any] = ["reason": outcome.reason ?? "sender_unavailable", "from": from, "available": available]
+			if let current = outcome.from {
+				details["current"] = current
+			}
+			throw APIError.invalidSender(ServerDelegate.sendFailureMessage(outcome.reason), details: details)
+		}
+		switch outcome.code {
 			case 200:
-				return ["ok": true, "accepted": true, "chat_id": chat_id, "attachments": files.count + photos.count]
+				return ["ok": true, "accepted": true, "chat_id": chat_id, "attachments": files.count + photos.count, "from": ServerDelegate.orNull(outcome.from), "service": ServerDelegate.orNull(outcome.service)]
 			case 400:
 				throw APIError.badRequest("Nothing to send")
 			default:
-				throw APIError.sendFailed(ServerDelegate.sendFailureMessage(ServerDelegate.lastSendFailure))
+				throw APIError.sendFailed(ServerDelegate.sendFailureMessage(outcome.reason))
 		}
 	}
 
@@ -1955,21 +2066,19 @@ class ServerDelegate {
 			case "chat_not_found": return "This group conversation does not exist on the iPhone."
 			case "missing_address": return "No recipient was given."
 			case "empty_message": return "Nothing to send."
+			case "sender_unavailable": return "`from` is not one of this iPhone's iMessage or SMS addresses. GET /api/v1/senders lists them."
+			case "sender_requires_imessage": return "This conversation is sent over SMS, which always uses the SIM number. Use that number as `from` or leave it out."
+			case "sender_locked_group": return "Group conversations keep the address they were started from. Changing it would split the group for the other members."
+			case "sender_unsupported": return "Messages did not accept the sender address for this conversation."
 			default: return "Messages refused to send the message (\(reason ?? "unknown"))."
 		}
 	}
 
-	static var lastSendFailure: String? {
-		get { sendFailureLock.lock(); defer { sendFailureLock.unlock() }; return _lastSendFailure[Thread.current.hash] }
-		set { sendFailureLock.lock(); defer { sendFailureLock.unlock() }; _lastSendFailure[Thread.current.hash] = newValue }
-	}
-	private static var _lastSendFailure = [Int: String]()
-	private static let sendFailureLock = NSLock()
-
-	static func sendText(params: [String:Any], new_files: [String]) -> Int {
+	static func sendText(params: [String:Any], new_files: [String]) -> SendOutcome {
 		var body: String = params["text"] as? String ?? ""
 		let address: String = params["chat"] as? String ?? ""
 		var subject: String = params["subject"] as? String ?? ""
+		let from: String = (params["from"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
 		var files = new_files
 
 		#if os(iOS)
@@ -1987,17 +2096,24 @@ class ServerDelegate {
 
 		guard !address.isEmpty else {
 			Const.log("event=message.send.rejected reason=missing_chat")
-			return 400
+			return SendOutcome(code: 400, reason: nil, service: nil, from: nil)
 		}
 
-		if body.count + files.count + subject.count > 0 {
-			let failure = ServerDelegate.sender.sendTextReturningFailure(body, withSubject: subject, toAddress: address, withAttachments: files)
-			ServerDelegate.lastSendFailure = failure
-			Const.log("event=message.send.ipc chat=\(address) ok=\(failure == nil) reason=\(failure ?? "none") files=\(files.count)")
-			return failure == nil ? 200 : 503
+		guard body.count + files.count + subject.count > 0 else {
+			return SendOutcome(code: 400, reason: nil, service: nil, from: nil)
 		}
 
-		return 400
+		let result = ServerDelegate.sender.sendText(body, subject: subject, toAddress: address, from: from.isEmpty ? nil : from, attachments: files) ?? [AnyHashable: Any]()
+		let ok = result["ok"] as? Bool ?? false
+		let outcome = SendOutcome(
+			code: ok ? 200 : 503,
+			reason: ok ? nil : (result["reason"] as? String ?? "unknown"),
+			service: result["service"] as? String,
+			from: result["from"] as? String
+		)
+		let code = outcome.isSenderProblem ? 400 : outcome.code
+		Const.log("event=message.send.ipc chat=\(address) ok=\(ok) reason=\(outcome.reason ?? "none") service=\(outcome.service ?? "none") from_given=\(!from.isEmpty) from_reported=\(outcome.from != nil) files=\(files.count)")
+		return SendOutcome(code: code, reason: outcome.reason, service: outcome.service, from: outcome.from)
 	}
 
 	static func sendGetRequest(params: [String:String]) -> (Int, String) {

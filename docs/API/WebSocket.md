@@ -1,5 +1,7 @@
 # WebSocket (API)
 
+> The current event stream (envelope, `hello`, `new-message`, `typing`, `read-message`, `battery-status`, `ping`/`pong`, authentication with `?token=`) is documented in the WebSocket section of [v1.md](./v1.md). The notes below describe the remote-relay protocol.
+
 All messages sent through the websocket follow the same JSON object format as specified in the [Remote.md](./Remote.md) document in this same directory; please consult that for these details.
 
 When using the REST Client, all messages in the `commands` table (in the Remote.md document linked above) are sent through the REST API except for the ones which have no corresponding REST API function (and `attachment-data`, as it says).
