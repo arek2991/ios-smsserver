@@ -1,4 +1,7 @@
-# API
+# Legacy API
+
+> This document describes the original query-parameter API (`/requests`, `/data`, `/send`). It keeps working unchanged, but new integrations should use the JSON REST API documented in [v1.md](./v1.md) (`/api/v1/...`), which adds bearer-token authentication, proper status codes, cursor pagination and CORS. The legacy endpoints now also accept `Authorization: Bearer <token>` or `?token=` in addition to IP authentication.
+
 
 All plain text GET requests must be made to \<ip>:\<port>/requests (e.g. 192.168.0.127:8741/requests). Requests for binary data (whether it be pictures from the camera roll, profile pictures, or attachments) must be sent to /data. All post requests must be directed to /send.
 
@@ -451,7 +454,7 @@ __Example Queries:__
 
 The `POST` requests are sent as multipart/form-data forms (as opposed to application/x-www-form-urlencoded), and are only used to send texts through the app. In practice, it's generally safe to not encode anything in requests to this url, but only percent encodings (e.g. using `%20` for spaces and `%2B` for plus signs) will be accepted and parsed correctly. For example, replacing spaces with plus signs (as is specified in [RFC1738](https://www.ietf.org/rfc/rfc1738.txt) will cause the string to be used raw, and none of the plus signs will be replaced with spaces.
 
-There are five key/value pairs that can be sent to this URL, and it accepts multiple files as well. For the text to actually send, you must include the chat, and then either at least 1 file, or something that is more than 0 characters for one of the other parameters.
+There are six key/value pairs that can be sent to this URL, and it accepts multiple files as well. For the text to actually send, you must include the chat, and then either at least 1 file, or something that is more than 0 characters for one of the other parameters.
 
 ### Parameter key/value pairs
 
@@ -462,6 +465,7 @@ There are five key/value pairs that can be sent to this URL, and it accepts mult
 | chat | Yes | String | Should be the chat_id of the conversation which you want to send this text to. Should be formatted in the same format as the `person` parameter above, under the `/requests` requests subsection.
 | photos | No | String | This should contain a list of the path of the photos (from the camera roll) that you want to send with this text, dlimited by colons and each without the `/var/mobile/Media/` prefix of their path. For example, if you wanted to send three photos with this text, this parameter may look something like `DCIM/100APPLE/IMG_0001.JPG:DCIM/100APPLE/IMG_0002.JPG:DCIM/100APPLE/IMG_0003.JPG`. |
 | attachments | No | Files | All the files that you send with a text must be attached to the key `attachments`, and you can send multiple files. I have managed to send up to 45mb of files at a time, but anything upwards of ~75mb at a time will fail (in my experience).
+| from | No | String | The address to send from, e.g. `me@icloud.com` or `+15557654321`. Must be one of the addresses listed by `GET /api/v1/senders`. An address that cannot be used makes the request fail with status 400. See [v1.md](./v1.md#choosing-the-sender-from). |
 
 ## Example requests to send a text
 

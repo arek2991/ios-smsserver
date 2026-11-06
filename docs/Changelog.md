@@ -1,4 +1,12 @@
 # Changelog
+0.9.2 &rightarrow; 0.9.3
+ - Send iMessages from a chosen address with `from` on `POST /api/v1/chats/{chat_id}/messages`, `POST /api/v1/messages` and `POST /send`
+ - New `GET /api/v1/senders` lists the addresses this iPhone can send from
+ - New `GET|POST /api/v1/imessage-status` checks whether recipients can receive iMessage, without sending
+ - Chat objects include `from`, the address the conversation currently sends from
+ - Sends to conversations stuck on SMS now let iOS re-check iMessage first, like opening the chat in Messages. Before, they went out as SMS/MMS even to iMessage users
+ - The app package now requires libsmserver 0.9.3
+
 0.8.0 &rightarrow; 0.9.0
  - Built in support for connecting to SMServer from outside of the same network by implementing new websocket API
  - Massively rewrote web interface to be easier to work with

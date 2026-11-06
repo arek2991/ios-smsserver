@@ -290,5 +290,45 @@ for (int x = 0; x < 4 && !msg; x++) {
 
 &nbsp;&nbsp;&nbsp;&nbsp; That's all it is :&#12;) Though you should note that marking the latest message as read this way marks all older messages in the conversation read as well. This method also automatically handles sending read receipts for you (if you have them turned on; obviously it doesn't send them if you have them turned off for this conversation), so you don't have to worry about manually doing that.
 
+## Choosing the sender address (iOS 16)
+&nbsp;&nbsp;&nbsp;&nbsp; One iPhone can send iMessages from several addresses: its own number, other numbers on the same Apple Account, and the Apple Account emails. They can even belong to different `IMAccount`s, for example one account for the SIM number and one for the Apple Account. The addresses an account can send from are its `vettedAliases`, and only accounts with `registrationStatus == 5` (registered) can use them:
+
+```objectivec
+for (IMAccount *account in [[%c(IMAccountController) sharedInstance] accounts]) {
+	if (![[account serviceName] isEqualToString:@"iMessage"] || [account registrationStatus] != 5) continue;
+	NSArray *aliases = [account vettedAliases];
+}
+```
+
+&nbsp;&nbsp;&nbsp;&nbsp; The address a message goes out from is the chat's `lastAddressedHandleID`, which is stored as `chat.last_addressed_handle` in `sms.db`. Set it before composing, and iOS switches the sending account (SIM number vs Apple Account) on its own, so you don't need `_setAccount:`. It sticks: later sends, including ones from the phone itself, keep using it.
+
+```objectivec
+[chat setLastAddressedHandleID:@"me@icloud.com"];
+```
+
+&nbsp;&nbsp;&nbsp;&nbsp; Don't change it on group chats. The other members would see you as a new participant, and the group splits on their side.
+
+## Making sure a chat is not stuck on SMS
+&nbsp;&nbsp;&nbsp;&nbsp; On iOS 16 the SMS chat and the iMessage chat for the same person are merged into one `IMChat`. Even `existingChatWithGUID:@"iMessage;-;..."` returns the merged object. After a respring that object is often on the SMS account, with `hasRefreshedServiceForSending == NO`. Messages fixes this when you open the conversation; a tweak has to do it itself before sending:
+
+```objectivec
+if ([chat respondsToSelector:@selector(refreshServiceForSending)] && ![chat hasRefreshedServiceForSending]) {
+	[chat refreshServiceForSending];
+}
+```
+
+&nbsp;&nbsp;&nbsp;&nbsp; This is asynchronous. `hasRefreshedServiceForSending` turns `YES` right away, before the chat is moved to iMessage, so it does not tell you the refresh is finished. Watch `[[chat account] serviceName]` instead. It usually changes within about 100 ms. `-[IMHandle IDStatus]` is always `0` inside SpringBoard, so you can't use it here.
+
+## Checking whether an address can receive iMessage
+&nbsp;&nbsp;&nbsp;&nbsp; This is the same lookup Messages makes before it turns a conversation blue. It goes through IDS, and SpringBoard is allowed to make it. Destinations are `tel:+E164` or `mailto:` URIs. In the result, `1` means registered and `2` means not registered:
+
+```objectivec
+[[%c(IDSIDQueryController) sharedInstance] refreshIDStatusForDestinations:@[@"tel:+15551234567", @"mailto:someone@example.com"] service:@"com.apple.madrid" listenerID:@"MyListener" queue:queue completionBlock:^(NSDictionary *statuses) {
+	NSInteger status = [statuses[@"tel:+15551234567"] integerValue];
+}];
+```
+
+&nbsp;&nbsp;&nbsp;&nbsp; The first lookup of an address goes to Apple's servers, and later ones come from a cache. Apple rate-limits these lookups. To turn a national number like `010-1234-5678` into international format, `[[account imHandleWithID:number] ID]` uses the device's region.
+
 ## Thanks for reading :&#12;)
 &nbsp;&nbsp;&nbsp;&nbsp; I would appreciate anything that anyone could add to this document. I'd love to compile as much information about these frameworks as I can.
