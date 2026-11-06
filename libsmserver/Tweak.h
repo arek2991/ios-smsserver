@@ -151,6 +151,11 @@
 - (IMHandle *)loginIMHandle;
 @end
 
+@interface IDSIDQueryController : NSObject
++ (id)sharedInstance;
+- (BOOL)refreshIDStatusForDestinations:(NSArray *)arg1 service:(NSString *)arg2 listenerID:(NSString *)arg3 queue:(dispatch_queue_t)arg4 completionBlock:(void (^)(NSDictionary *))arg5;
+@end
+
 @interface IMServiceImpl : NSObject
 + (id)iMessageService;
 + (id)smsService;

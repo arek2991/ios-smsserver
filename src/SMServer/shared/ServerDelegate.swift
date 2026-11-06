@@ -1208,6 +1208,15 @@ class ServerDelegate {
 				let items = try listSenders()
 				sendJSON(res, ["items": items, "count": items.count], extra: cors)
 
+			case "imessage-status":
+				try requireMethod(method, oneOf: [.get, .post])
+				_ = try requireAuth(req, ip: ip)
+				guard parts.count == 1 else {
+					throw APIError.notFound("No such endpoint")
+				}
+				let result = try imessageStatus(ServerDelegate.statusAddresses(req))
+				sendJSON(res, result, extra: cors)
+
 			case "attachments":
 				try requireMethod(method, oneOf: [.get])
 				_ = try requireAuth(req, ip: ip)
@@ -1746,6 +1755,54 @@ class ServerDelegate {
 		let items = raw.compactMap({ $0 as? [String: Any] })
 		Const.log("event=senders.list count=\(items.count)")
 		return items
+	}
+
+	static let imessageStatusMaxAddresses = 25
+
+	static func statusAddresses(_ req: CRRequest) -> [String] {
+		let body = jsonBody(req)
+		var raw = [String]()
+		if let list = body["addresses"] as? [Any] {
+			raw += list.compactMap({ $0 as? String })
+		}
+		for key in ["addresses", "address"] {
+			if let joined = body[key] as? String {
+				raw += joined.split(separator: ",").map({ String($0) })
+			}
+			if let joined = req.query[key] {
+				raw += joined.split(separator: ",").map({ String($0) })
+			}
+		}
+		var seen = Set<String>()
+		return raw.map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) }).filter({ !$0.isEmpty && seen.insert($0).inserted })
+	}
+
+	func imessageStatus(_ addresses: [String]) throws -> [String: Any] {
+		guard !addresses.isEmpty else {
+			throw APIError.badRequest("Provide at least one address (`address` query parameter, comma separated, or `addresses` in a JSON body)")
+		}
+		guard addresses.count <= ServerDelegate.imessageStatusMaxAddresses else {
+			throw APIError.badRequest("At most \(ServerDelegate.imessageStatusMaxAddresses) addresses per request", details: ["count": addresses.count, "max": ServerDelegate.imessageStatusMaxAddresses])
+		}
+		guard let result = ServerDelegate.sender.getIMessageStatus(addresses) as? [String: Any] else {
+			Const.log("event=imessage_status.failed reason=tweak_unreachable count=\(addresses.count)", warning: true)
+			throw APIError.tweakUnreachable("The Messages tweak in SpringBoard did not answer. Respring the device or reinstall libsmserver 0.9.3 or later.")
+		}
+		guard result["ok"] as? Bool ?? false else {
+			let reason = result["reason"] as? String ?? "unknown"
+			Const.log("event=imessage_status.failed reason=\(reason) count=\(addresses.count)", warning: true)
+			throw APIError(502, "lookup_failed", "Messages could not look up iMessage availability (\(reason)).")
+		}
+		let items: [[String: Any]] = (result["items"] as? [Any] ?? []).compactMap({ raw in
+			guard var item = raw as? [String: Any] else { return nil }
+			for key in ["normalized", "imessage"] where item[key] == nil {
+				item[key] = NSNull()
+			}
+			return item
+		})
+		let timed_out = result["timed_out"] as? Bool ?? false
+		Const.log("event=imessage_status count=\(items.count) timed_out=\(timed_out) elapsed_ms=\(result["elapsed_ms"] as? Int ?? -1)")
+		return ["items": items, "count": items.count, "timed_out": timed_out]
 	}
 
 	func sendMessage(_ chat_id: String, req: CRRequest, ip: String) throws -> [String: Any] {

@@ -35,6 +35,10 @@ static void SMSFileLog(NSString *line) {
 
 static double const SMSServiceRefreshTimeout = 3.0;
 static double const SMSServiceRefreshSenderTimeout = 8.0;
+static double const SMSIDStatusTimeout = 8.0;
+static NSUInteger const SMSIDStatusMaxAddresses = 25;
+static NSString *const SMSIDStatusService = @"com.apple.madrid";
+static NSString *const SMSIDStatusListener = @"SMServer-IDStatusQuery";
 static unsigned long long const SMSModernCapabilities = 4485895ULL;
 static unsigned int const SMSLegacyCapabilities = 17159;
 static NSString *const SMSTweakVersion = @"0.9.3";
@@ -356,6 +360,50 @@ static NSString *SMSApplySender(IMChat *chat, NSDictionary *sender) {
 	return ok ? nil : @"sender_unsupported";
 }
 
+static IMAccount *SMSNormalizationAccount(void) {
+	IMAccountController *controller = [%c(IMAccountController) sharedInstance];
+	NSArray *accounts = [controller respondsToSelector:@selector(accounts)] ? [controller accounts] : @[];
+	for (IMAccount *account in accounts) {
+		if ([SMSAccountService(account) isEqualToString:@"iMessage"] && SMSAccountIsUsable(account)) return account;
+	}
+	return SMSUsableSMSAccount();
+}
+
+static NSString *SMSIDSDestination(NSString *address, IMAccount *account, NSString **normalized) {
+	NSString *trimmed = [address stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+	for (NSString *prefix in @[@"mailto:", @"tel:", @"sms:", @"imessage:"]) {
+		if ([trimmed.lowercaseString hasPrefix:prefix]) {
+			trimmed = [trimmed substringFromIndex:prefix.length];
+			break;
+		}
+	}
+	if ([trimmed containsString:@"@"]) {
+		NSString *email = trimmed.lowercaseString;
+		NSArray *parts = [email componentsSeparatedByString:@"@"];
+		if (parts.count != 2 || ![parts[0] length] || ![parts[1] containsString:@"."]) return nil;
+		*normalized = email;
+		return [@"mailto:" stringByAppendingString:email];
+	}
+	NSString *digits = SMSDigits(trimmed);
+	if (digits.length < 7) return nil;
+	IMHandle *handle = [account respondsToSelector:@selector(imHandleWithID:)] ? [account imHandleWithID:trimmed] : nil;
+	NSString *phone = [handle respondsToSelector:@selector(ID)] ? [handle ID] : nil;
+	if (![phone hasPrefix:@"+"] && [trimmed hasPrefix:@"+"]) phone = trimmed;
+	if (![phone hasPrefix:@"+"] || SMSDigits(phone).length < 8) return nil;
+	phone = [@"+" stringByAppendingString:SMSDigits(phone)];
+	*normalized = phone;
+	return [@"tel:" stringByAppendingString:phone];
+}
+
+static dispatch_queue_t SMSIDStatusQueue(void) {
+	static dispatch_queue_t queue = nil;
+	static dispatch_once_t onceToken;
+	dispatch_once(&onceToken, ^{
+		queue = dispatch_queue_create("com.ianwelker.smserver.idstatus", DISPATCH_QUEUE_SERIAL);
+	});
+	return queue;
+}
+
 static IMChat *SMSExistingIMessageChat(NSString *address) {
 	IMChatRegistry *registry = [%c(IMChatRegistry) sharedInstance];
 	if ([registry respondsToSelector:@selector(existingChatWithGUID:)]) {
@@ -601,6 +649,7 @@ static NSString *SMSSentFromAddress(IMChat *chat, IMMessage *message) {
 	if ([method isEqualToString:@"delete"]) return [self deleteObject:args];
 	if ([method isEqualToString:@"sendTyping"]) return [self sendTyping:args];
 	if ([method isEqualToString:@"getSenders"]) return [self getSenders];
+	if ([method isEqualToString:@"getIMessageStatus"]) return [self getIMessageStatus:args];
 	SMSLog(@"event=ipc_unknown_method method=%@", method);
 	[NSException raise:@"SMSUnknownMethod" format:@"unknown method %@", method];
 	return nil;
@@ -641,6 +690,89 @@ static NSString *SMSSentFromAddress(IMChat *chat, IMMessage *message) {
 		}
 	}
 	SMSLog(@"event=service_refresh_unchanged waited_s=%.1f service=%@", timeout, initial);
+}
+
+- (NSDictionary *)getIMessageStatus:(id)vals {
+	id raw = [vals isKindOfClass:[NSDictionary class]] ? vals[@"addresses"] : nil;
+	NSArray *addresses = [raw isKindOfClass:[NSArray class]] ? raw : nil;
+	if (!addresses.count || addresses.count > SMSIDStatusMaxAddresses) {
+		SMSLog(@"event=idstatus_rejected reason=invalid_addresses count=%lu", (unsigned long)addresses.count);
+		return @{@"ok": @NO, @"reason": @"invalid_addresses"};
+	}
+	Class queryClass = %c(IDSIDQueryController);
+	IDSIDQueryController *controller = [queryClass respondsToSelector:@selector(sharedInstance)] ? [queryClass sharedInstance] : nil;
+	if (![controller respondsToSelector:@selector(refreshIDStatusForDestinations:service:listenerID:queue:completionBlock:)]) {
+		SMSLog(@"event=idstatus_failed reason=ids_unavailable class=%d", queryClass != nil);
+		return @{@"ok": @NO, @"reason": @"ids_unavailable"};
+	}
+	NSArray<NSDictionary *> *rows = SMSRunOnMain(@"idstatus_prepare", ^id{
+		IMAccount *account = SMSNormalizationAccount();
+		NSMutableArray *prepared = [NSMutableArray arrayWithCapacity:addresses.count];
+		for (id address in addresses) {
+			NSString *input = [address isKindOfClass:[NSString class]] ? address : @"";
+			NSString *normalized = nil;
+			NSString *destination = input.length ? SMSIDSDestination(input, account, &normalized) : nil;
+			NSMutableDictionary *row = [NSMutableDictionary dictionaryWithObject:input forKey:@"address"];
+			if (destination) {
+				row[@"destination"] = destination;
+				row[@"normalized"] = normalized;
+			}
+			[prepared addObject:row];
+		}
+		return prepared;
+	});
+	if (!rows) return @{@"ok": @NO, @"reason": @"internal_error"};
+	NSMutableOrderedSet<NSString *> *destinations = [NSMutableOrderedSet orderedSet];
+	for (NSDictionary *row in rows) {
+		if (row[@"destination"]) [destinations addObject:row[@"destination"]];
+	}
+	__block NSDictionary *statuses = nil;
+	BOOL timedOut = NO;
+	CFAbsoluteTime startedAt = CFAbsoluteTimeGetCurrent();
+	if (destinations.count) {
+		dispatch_semaphore_t done = dispatch_semaphore_create(0);
+		BOOL started = [controller refreshIDStatusForDestinations:destinations.array service:SMSIDStatusService listenerID:SMSIDStatusListener queue:SMSIDStatusQueue() completionBlock:^(NSDictionary *result) {
+			statuses = [result isKindOfClass:[NSDictionary class]] ? [result copy] : @{};
+			dispatch_semaphore_signal(done);
+		}];
+		if (started) {
+			timedOut = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(SMSIDStatusTimeout * NSEC_PER_SEC))) != 0;
+		} else {
+			SMSLog(@"event=idstatus_query_not_started destinations=%lu", (unsigned long)destinations.count);
+		}
+	}
+	NSDictionary *results = timedOut ? @{} : (statuses ?: @{});
+	NSMutableArray *items = [NSMutableArray arrayWithCapacity:rows.count];
+	NSUInteger registered = 0, unregistered = 0, unknown = 0, invalid = 0;
+	for (NSDictionary *row in rows) {
+		NSString *destination = row[@"destination"];
+		NSString *status = @"invalid_address";
+		NSNumber *imessage = nil;
+		if (destination) {
+			NSInteger code = [results[destination] respondsToSelector:@selector(integerValue)] ? [results[destination] integerValue] : 0;
+			if (code == 1) {
+				status = @"registered";
+				imessage = @YES;
+				registered++;
+			} else if (code == 2) {
+				status = @"not_registered";
+				imessage = @NO;
+				unregistered++;
+			} else {
+				status = @"unknown";
+				unknown++;
+			}
+		} else {
+			invalid++;
+		}
+		NSMutableDictionary *item = [NSMutableDictionary dictionaryWithDictionary:@{@"address": row[@"address"], @"status": status}];
+		if (row[@"normalized"]) item[@"normalized"] = row[@"normalized"];
+		if (imessage) item[@"imessage"] = imessage;
+		[items addObject:item];
+	}
+	double elapsed = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000.0;
+	SMSLog(@"event=idstatus_done count=%lu registered=%lu not_registered=%lu unknown=%lu invalid=%lu timed_out=%d elapsed_ms=%.0f", (unsigned long)items.count, (unsigned long)registered, (unsigned long)unregistered, (unsigned long)unknown, (unsigned long)invalid, timedOut, elapsed);
+	return @{@"ok": @YES, @"items": items, @"timed_out": @(timedOut), @"elapsed_ms": @((long long)elapsed)};
 }
 
 - (NSDictionary *)getSenders {
@@ -985,6 +1117,7 @@ static void SMSNoteTyping(IMMessageItem *item, BOOL typing) {
 		if (!SMSInSpringBoard) return;
 		dlopen("/System/Library/PrivateFrameworks/IMCore.framework/IMCore", RTLD_LAZY);
 		dlopen("/System/Library/PrivateFrameworks/ChatKit.framework/ChatKit", RTLD_LAZY);
+		dlopen("/System/Library/PrivateFrameworks/IDS.framework/IDS", RTLD_LAZY);
 		Class daemonClass = objc_getClass("IMDaemonController");
 		if (daemonClass && class_getInstanceMethod(daemonClass, @selector(processCapabilities))) {
 			%init(CapabilitiesModern);

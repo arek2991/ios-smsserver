@@ -8,6 +8,7 @@ static double const SMSSendTimeout = 60.0;
 static double const SMSDefaultTimeout = 15.0;
 static double const SMSTypingTimeout = 5.0;
 static double const SMSPingTimeout = 8.0;
+static double const SMSIDStatusTimeout = 20.0;
 
 static id SMSCallSpringBoard(NSString *method, id args, double timeout) {
 	NSError *error = nil;
@@ -165,6 +166,16 @@ static BOOL SMSBoolResult(id result) {
 	if (!ok && !outcome[@"reason"]) outcome[@"reason"] = @"unknown";
 	SMSAppLog(@"event=send_text ok=%d reason=%@ service=%@ from_requested=%d from_reported=%d body_length=%lu attachments=%lu", ok, outcome[@"reason"] ?: @"none", outcome[@"service"] ?: @"?", from.length > 0, outcome[@"from"] != nil, (unsigned long)body.length, (unsigned long)files.count);
 	return outcome;
+}
+
+- (NSDictionary *)getIMessageStatus:(NSArray *)addresses {
+	id result = SMSCallSpringBoard(@"getIMessageStatus", @{@"addresses": addresses ?: @[]}, SMSIDStatusTimeout);
+	if (![result isKindOfClass:[NSDictionary class]]) {
+		SMSAppLog(@"event=imessage_status ok=0 reachable=0 count=%lu", (unsigned long)addresses.count);
+		return nil;
+	}
+	SMSAppLog(@"event=imessage_status ok=%d reason=%@ count=%lu timed_out=%@ elapsed_ms=%@", [result[@"ok"] boolValue], result[@"reason"] ?: @"none", (unsigned long)addresses.count, result[@"timed_out"], result[@"elapsed_ms"]);
+	return result;
 }
 
 - (NSArray *)getSenders {
