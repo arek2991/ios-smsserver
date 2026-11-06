@@ -7,7 +7,7 @@ import Photos
 import Contacts
 #endif
 
-let chat_columns = ["m.ROWID", "m.is_read", "m.is_from_me", "m.text", "m.attributedBody", "m.item_type", "m.date_read", "m.date", "m.cache_has_attachments", "m.balloon_bundle_id", "m.share_direction", "c.chat_identifier", "c.display_name", "c.room_name"]
+let chat_columns = ["m.ROWID", "m.is_read", "m.is_from_me", "m.text", "m.attributedBody", "m.item_type", "m.date_read", "m.date", "m.cache_has_attachments", "m.balloon_bundle_id", "m.share_direction", "c.chat_identifier", "c.display_name", "c.room_name", "c.last_addressed_handle"]
 
 final class ChatDelegate {
 	let settings = Settings.shared()
@@ -331,6 +331,9 @@ final class ChatDelegate {
 			new_chat["relative_time"] = Const.getRelativeTime(ts: Double(chat["m.date"] as? String ?? "0") ?? 0.0)
 			new_chat["is_group"] = is_group
 			new_chat["chat_identifier"] = chat_id
+			if let from = chat["c.last_addressed_handle"] as? String, !from.isEmpty {
+				new_chat["from"] = from
+			}
 			new_chat["time_marker"] = Int(chat["m.date"] as? String ?? "0")
 
 			new_chat["members"] = getGroupRecipientsWithDb(contact_db: contact_db, db: db, ci: chat_id)

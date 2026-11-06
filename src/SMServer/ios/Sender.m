@@ -142,23 +142,46 @@ static BOOL SMSBoolResult(id result) {
 }
 
 - (NSString *)sendTextReturningFailure:(NSString *)body withSubject:(NSString *)subject toAddress:(NSString *)address withAttachments:(NSArray *)paths {
+	NSDictionary *result = [self sendText:body subject:subject toAddress:address from:nil attachments:paths];
+	return [result[@"ok"] boolValue] ? nil : result[@"reason"];
+}
+
+- (NSDictionary *)sendText:(NSString *)body subject:(NSString *)subject toAddress:(NSString *)address from:(NSString *)from attachments:(NSArray *)paths {
 	NSMutableArray *files = [NSMutableArray array];
 	for (id path in paths ?: @[]) {
 		if ([path isKindOfClass:[NSString class]]) [files addObject:path];
 	}
-	NSDictionary *args = @{@"body": body ?: @"", @"subject": subject ?: @"", @"address": address ?: @"", @"attachment": files};
+	NSMutableDictionary *args = [NSMutableDictionary dictionaryWithDictionary:@{@"body": body ?: @"", @"subject": subject ?: @"", @"address": address ?: @"", @"attachment": files}];
+	if (from.length) args[@"from"] = from;
 	id result = SMSCallSpringBoard(@"sendText", args, SMSSendTimeout);
 	BOOL ok = SMSBoolResult(result);
-	NSString *reason = nil;
-	NSString *service = nil;
+	NSMutableDictionary *outcome = [NSMutableDictionary dictionaryWithObject:@(ok) forKey:@"ok"];
 	if ([result isKindOfClass:[NSDictionary class]]) {
-		reason = [result[@"reason"] isKindOfClass:[NSString class]] ? result[@"reason"] : nil;
-		service = [result[@"service"] isKindOfClass:[NSString class]] ? result[@"service"] : nil;
+		for (NSString *key in @[@"reason", @"service", @"from"]) {
+			if ([result[key] isKindOfClass:[NSString class]]) outcome[key] = result[key];
+		}
 	}
-	if (!result) reason = @"springboard_unreachable";
-	if (!ok && !reason) reason = @"unknown";
-	SMSAppLog(@"event=send_text ok=%d reason=%@ service=%@ body_length=%lu attachments=%lu", ok, reason ?: @"none", service ?: @"?", (unsigned long)body.length, (unsigned long)files.count);
-	return ok ? nil : reason;
+	if (!result) outcome[@"reason"] = @"springboard_unreachable";
+	if (!ok && !outcome[@"reason"]) outcome[@"reason"] = @"unknown";
+	SMSAppLog(@"event=send_text ok=%d reason=%@ service=%@ from_requested=%d from_reported=%d body_length=%lu attachments=%lu", ok, outcome[@"reason"] ?: @"none", outcome[@"service"] ?: @"?", from.length > 0, outcome[@"from"] != nil, (unsigned long)body.length, (unsigned long)files.count);
+	return outcome;
+}
+
+- (NSArray *)getSenders {
+	id result = SMSCallSpringBoard(@"getSenders", nil, SMSDefaultTimeout);
+	if (![result isKindOfClass:[NSDictionary class]] || ![result[@"ok"] boolValue] || ![result[@"items"] isKindOfClass:[NSArray class]]) {
+		SMSAppLog(@"event=senders ok=0 reachable=%d reason=%@", result != nil, [result isKindOfClass:[NSDictionary class]] ? result[@"reason"] : @"unreachable");
+		return nil;
+	}
+	NSMutableArray *items = [NSMutableArray array];
+	for (id item in result[@"items"]) {
+		if (![item isKindOfClass:[NSDictionary class]] || ![item[@"address"] isKindOfClass:[NSString class]]) continue;
+		NSArray *services = [item[@"services"] isKindOfClass:[NSArray class]] ? item[@"services"] : @[];
+		NSString *type = [item[@"type"] isKindOfClass:[NSString class]] ? item[@"type"] : @"phone";
+		[items addObject:@{@"address": item[@"address"], @"type": type, @"services": services}];
+	}
+	SMSAppLog(@"event=senders ok=1 count=%lu", (unsigned long)items.count);
+	return items;
 }
 
 - (BOOL)markConvoAsRead:(NSString *)chat_id {

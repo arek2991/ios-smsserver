@@ -32,6 +32,8 @@
 - (id)messageWithComposition:(id)arg1;
 - (void)sendMessage:(id)arg1 newComposition:(bool)arg2;
 - (void)sendMessage:(id)arg1 onService:(id)arg2 newComposition:(bool)arg3;
+- (id)selectedLastAddressedHandle;
+- (void)setSelectedLastAddressedHandle:(id)arg1;
 @end
 
 @interface CKConversationList : NSObject
@@ -80,6 +82,12 @@
 - (IMAccount *)account;
 - (id)lastSentMessage;
 - (void)setLocalUserIsTyping:(BOOL)arg1;
+- (NSString *)lastAddressedHandleID;
+- (void)setLastAddressedHandleID:(NSString *)arg1;
+- (NSString *)lastAddressedSIMID;
+- (unsigned char)chatStyle;
+- (void)refreshServiceForSending;
+- (BOOL)hasRefreshedServiceForSending;
 @end
 
 @interface IMChatItem : NSObject
@@ -98,11 +106,15 @@
 @interface IMChatRegistry : NSObject
 + (id)sharedInstance;
 - (id)chatForIMHandle:(id)arg1;
+- (id)chatForIMHandle:(id)arg1 lastAddressedHandle:(id)arg2 lastAddressedSIMID:(id)arg3;
 - (id)existingChatWithChatIdentifier:(id)arg1;
+- (id)existingChatWithGUID:(id)arg1;
+- (NSArray *)allExistingChats;
 @end
 
 @interface IMHandle : NSObject
 - (id)initWithAccount:(id)arg1 ID:(id)arg2 alreadyCanonical:(_Bool)arg3;
+- (NSString *)ID;
 @end
 
 @interface IMMessageItem : NSObject
@@ -122,6 +134,7 @@
 - (bool)isDelivered;
 - (bool)isSent;
 - (bool)isRead;
+- (IMHandle *)sender;
 @end
 
 @interface IMAccount : NSObject
@@ -129,6 +142,13 @@
 - (NSString *)serviceName;
 - (BOOL)isActive;
 - (BOOL)isOperational;
+- (NSArray *)aliases;
+- (NSArray *)vettedAliases;
+- (int)validationStatusForAlias:(id)arg1;
+- (int)registrationStatus;
+- (NSString *)strippedLogin;
+- (NSString *)login;
+- (IMHandle *)loginIMHandle;
 @end
 
 @interface IMServiceImpl : NSObject
@@ -143,4 +163,5 @@
 - (id)__ck_bestAccountForAddress:(id)arg1;
 - (id)bestAccountForService:(id)arg1;
 - (NSArray *)accounts;
+- (id)iMessageAccountForLastAddressedHandle:(id)arg1 simID:(id)arg2;
 @end
