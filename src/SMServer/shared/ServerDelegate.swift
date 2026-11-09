@@ -657,6 +657,10 @@ class ServerDelegate {
 			decorated["chat_identifier"] = chat
 		}
 
+		if decorated["destination_caller_id"] == nil {
+			decorated["destination_caller_id"] = NSNull()
+		}
+
 		return decorated
 	}
 

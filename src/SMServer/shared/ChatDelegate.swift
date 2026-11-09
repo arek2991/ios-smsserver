@@ -51,6 +51,33 @@ final class ChatDelegate {
 		db = nil
 	}
 
+	private let message_columns_lock = NSLock()
+	private var receiving_address_columns: [String]? = nil
+
+	final func receivingAddressColumns(db: OpaquePointer?) -> [String] {
+		message_columns_lock.lock()
+		defer { message_columns_lock.unlock() }
+		if let cached = receiving_address_columns { return cached }
+
+		var statement: OpaquePointer?
+		guard db != nil, sqlite3_prepare_v2(db, "PRAGMA table_info(message);", -1, &statement, nil) == SQLITE_OK else {
+			Const.log("event=message_columns_failed column=destination_caller_id", warning: true)
+			return []
+		}
+		var names = Set<String>()
+		while sqlite3_step(statement) == SQLITE_ROW {
+			if let name = sqlite3_column_text(statement, 1) {
+				names.insert(String(cString: name))
+			}
+		}
+		sqlite3_finalize(statement)
+
+		let columns = names.contains("destination_caller_id") ? ["m.destination_caller_id"] : []
+		receiving_address_columns = columns
+		Const.log("event=message_columns destination_caller_id=\(!columns.isEmpty) total=\(names.count)")
+		return columns
+	}
+
 	/// It's just too big to do one line
 	final func selectFromSql(
 		db: OpaquePointer?,
@@ -241,6 +268,10 @@ final class ChatDelegate {
 			if let serv = texts[i]["service"] as? String {
 				texts[i]["imessage"] = serv == "iMessage"
 				texts[i].removeValue(forKey: "service")
+			}
+
+			if let local = texts[i]["destination_caller_id"] as? String, local.isEmpty {
+				texts[i]["destination_caller_id"] = NSNull()
 			}
 
 			texts[i]["is_group"] = is_group
@@ -499,7 +530,7 @@ final class ChatDelegate {
 
 		var messages: [[String:Any]] = selectFromSql(
 			db: db,
-			columns: ["m.ROWID", "m.guid", "m.text", "m.attributedBody", "m.subject", "m.is_from_me", "m.date", "m.date_read", "m.service", "m.cache_has_attachments", "m.balloon_bundle_id", "m.payload_data", "m.associated_message_guid", "m.associated_message_type", "m.item_type", "m.group_action_type", "m.other_handle", "h.id"],
+			columns: ["m.ROWID", "m.guid", "m.text", "m.attributedBody", "m.subject", "m.is_from_me", "m.date", "m.date_read", "m.service", "m.cache_has_attachments", "m.balloon_bundle_id", "m.payload_data", "m.associated_message_guid", "m.associated_message_type", "m.item_type", "m.group_action_type", "m.other_handle", "h.id"] + receivingAddressColumns(db: db),
 			table: "message m",
 			condition: "left join handle h on h.ROWID = m.handle_id where m.ROWID in (select message_id from chat_message_join where chat_id in (select ROWID from chat where chat_identifier is \(fixed_num)\(from_string))) order by m.date desc",
 			args: num.split(separator: ",").map({String($0)}),
@@ -1130,7 +1161,7 @@ final class ChatDelegate {
 		for _ in 0..<10 {
 			text_array = selectFromSql(
 				db: db,
-				columns: ["m.ROWID", "m.guid", "m.text", "m.attributedBody", "m.subject", "m.is_from_me", "m.date", "m.date_read", "m.service", "m.cache_has_attachments", "m.handle_id", "m.balloon_bundle_id", "m.associated_message_guid", "m.associated_message_type", "h.id", "c.chat_identifier", "c.room_name"],
+				columns: ["m.ROWID", "m.guid", "m.text", "m.attributedBody", "m.subject", "m.is_from_me", "m.date", "m.date_read", "m.service", "m.cache_has_attachments", "m.handle_id", "m.balloon_bundle_id", "m.associated_message_guid", "m.associated_message_type", "h.id", "c.chat_identifier", "c.room_name"] + receivingAddressColumns(db: db),
 				table: "message m",
 				condition: "left join handle h on h.ROWID = m.handle_id inner join chat_message_join j on j.message_id = m.ROWID inner join chat c on j.chat_id = c.ROWID where m.guid is ?",
 				args: [guid],
